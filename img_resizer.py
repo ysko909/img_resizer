@@ -104,7 +104,7 @@ def is_supported_image(path: Path) -> bool:
     if path.suffix.lower() in ALLOWED_EXTS:
         return True
     
-    # 拡張子が未知の場合、試しに開いてみる（コストが高いので慎重に）
+    # 拡張子が未知の場合、試しに開いてみる
     try:
         with Image.open(path) as im:
             im.verify()
@@ -139,11 +139,9 @@ def resize_static_image(
     new_size: Tuple[int, int]
 ) -> Image.Image:
     """
-    静止画像のリサイズ（EXIFの向き補正込み）。
+    静止画像のリサイズ。
+    ※ 呼び出し側で既に exif_transpose 済みであることを前提とする。
     """
-    # EXIFの向き情報を適用して画像を回転させる
-    im = ImageOps.exif_transpose(im)
-
     # パレットモード(P)や1bit(1)の場合、リサイズ品質向上のためRGBA/RGBに変換
     if im.mode in ("P", "1", "LA"):
         im = im.convert("RGBA")
@@ -161,9 +159,8 @@ def save_image_with_metadata(
     """
     形式ごとのメタデータ配慮をしつつ保存。
     """
-    # フォーマット判定（元画像の情報 または 拡張子から推測）
+    # フォーマット判定
     fmt = (src_info.get("format") or src.suffix.replace(".", "")).upper()
-    # "JPEG" 表記に統一
     if fmt == "JPG":
         fmt = "JPEG"
 
@@ -177,7 +174,6 @@ def save_image_with_metadata(
     # JPEGの場合、アルファチャンネル(RGBA)があると保存できないためRGBに変換
     if fmt == "JPEG":
         if im_resized.mode in ("RGBA", "LA"):
-            # 背景を白にしてRGB化
             background = Image.new("RGB", im_resized.size, (255, 255, 255))
             background.paste(im_resized, mask=im_resized.split()[-1])
             im_resized = background
@@ -186,7 +182,7 @@ def save_image_with_metadata(
             
         save_kwargs.update({
             "quality": 95,
-            "subsampling": 0, # 高画質設定
+            "subsampling": 0,
             "progressive": True,
             "optimize": True
         })
@@ -198,7 +194,6 @@ def save_image_with_metadata(
             "optimize": True,
             "compress_level": 9
         })
-        # PNGはEXIFを保持しないのが一般的だが、Pillowは一部サポートしているため渡してみる
         if exif:
             try:
                 save_kwargs["exif"] = exif
@@ -225,31 +220,23 @@ def save_image_with_metadata(
 def resize_animated_gif(src: Path, percent: float, prefix: str) -> Path:
     """
     アニメGIFをフレームごとにリサイズして保存。
-    各フレームのduration（表示時間）を収集して維持する。
     """
     with Image.open(src) as im:
-        # GIF固有情報
         loop = im.info.get("loop", 0)
-        # グローバルな disposal method (ない場合は 2:背景色で塗りつぶし を仮定)
         default_disposal = im.info.get("disposal", 2)
         icc = im.info.get("icc_profile")
 
         new_size = compute_new_size(im.size, percent)
         
         frames = []
-        durations = [] # 各フレームの表示時間を保持
-        disposals = [] # 各フレームの処理方法
+        durations = []
+        disposals = []
 
         for frame in ImageSequence.Iterator(im):
-            # 各フレームの持続時間を取得 (デフォルト100ms)
             durations.append(frame.info.get("duration", 100))
             disposals.append(frame.info.get("disposal", default_disposal))
 
-            # フレームのリサイズ処理
-            # RGBA変換してからリサイズし、GIF用のパレットモードに戻す
             fr = frame.convert("RGBA").resize(new_size, resample=Image.Resampling.LANCZOS)
-            
-            # 透過部分の処理品質を上げるため、ディザリングありでパレット変換
             fr = fr.convert("P", palette=Image.Palette.ADAPTIVE, dither=Image.Dither.FLOYDSTEINBERG)
             frames.append(fr)
 
@@ -262,7 +249,7 @@ def resize_animated_gif(src: Path, percent: float, prefix: str) -> Path:
             "save_all": True,
             "append_images": frames[1:],
             "loop": loop,
-            "duration": durations, # リストで渡すことで可変フレームレートに対応
+            "duration": durations,
             "disposal": disposals,
             "optimize": True,
         }
@@ -275,47 +262,40 @@ def resize_animated_gif(src: Path, percent: float, prefix: str) -> Path:
 
 def process_one_image(src: Path, percent: float, prefix: str) -> Optional[Path]:
     """
-    1ファイルのリサイズ実行。
+    1ファイルのリサイズ実行（EXIF回転バグ修正版）。
     """
     try:
-        # まずメタデータ取得とGIF判定のために開く
         is_animated = False
         src_info = {}
-        original_size = (0, 0)
         
+        # 1. 予備情報を取得
         with Image.open(src) as im:
-            # フォーマット判定
             fmt = (im.format or src.suffix.replace(".", "")).upper()
-            original_size = im.size
-            
-            # アニメGIF判定 (n_frames属性を確認)
             if fmt == "GIF" and getattr(im, "n_frames", 1) > 1:
                 is_animated = True
             
-            # 通常画像用情報の退避 (ファイルポインタが閉じる前に)
-            if not is_animated:
-                src_info = {
-                    "format": fmt,
-                    "exif": im.info.get("exif"),
-                    "icc_profile": im.info.get("icc_profile"),
-                }
-                # 画像データをメモリにロードしてリサイズ処理へ回す
-                # (loadしておかないとcontextを抜けた後に操作できない)
-                im.load()
-                # ここでリサイズ関数へ渡すためのコピーを作成してもよいが、
-                # context内で完結させる方が安全。
-                # ただし process_one_image の責務分離のため、
-                # 下記ではファイルパスを渡す(GIF)か、ロード済みImageを渡す(静止画)かで分岐する
+            src_info = {
+                "format": fmt,
+                "exif": im.info.get("exif"),
+                "icc_profile": im.info.get("icc_profile"),
+            }
 
-        # アニメーションGIFの場合（専用処理）
+        # 2. アニメーションGIFの場合
         if is_animated:
             return resize_animated_gif(src, percent, prefix)
         
-        # 静止画の場合
-        # ここでは再度 open せず、処理用の open を行う
+        # 3. 静止画の場合
         with Image.open(src) as im:
+            # --- 修正ポイント：リサイズ計算の前に回転を適用する ---
+            im = ImageOps.exif_transpose(im)
+            
+            # 正しい向きになった後の im.size を使って計算
             new_size = compute_new_size(im.size, percent)
+            
+            # リサイズ実行
             im_resized = resize_static_image(im, new_size)
+            
+            # 保存
             dst = unique_output_path(src, prefix)
             save_image_with_metadata(im_resized, src, dst, src_info)
             return dst
@@ -349,7 +329,6 @@ def main() -> None:
         dst = process_one_image(src, percent, prefix)
         if dst:
             success_count += 1
-            # 進捗表示
             print(f"[{i}/{len(targets)}] OK: {src.name} -> {dst.name}")
         else:
             print(f"[{i}/{len(targets)}] NG: {src.name}")
@@ -357,11 +336,9 @@ def main() -> None:
     print("-----------------------------------")
     print(f"[完了] 成功: {success_count} / 失敗: {len(targets) - success_count}")
     
-    # 1つでも失敗があれば終了コードを変える（運用自動化のため）
     if success_count < len(targets):
         sys.exit(2)
 
 
 if __name__ == "__main__":
     main()
- 
